@@ -3,7 +3,7 @@ from typing import List, Dict, Optional, Any, Tuple
 import uuid
 from datetime import datetime
 from .llm_controller import LLMController
-from .retrievers import ChromaRetriever
+from .retrievers import ChromaRetriever, PersistentChromaRetriever
 import json
 import logging
 from rank_bm25 import BM25Okapi
@@ -95,7 +95,9 @@ class AgenticMemorySystem:
                  llm_backend: str = "openai",
                  llm_model: str = "gpt-4o-mini",
                  evo_threshold: int = 100,
-                 api_key: Optional[str] = None):  
+                 api_key: Optional[str] = None,
+                 persist_directory: Optional[str] = None,
+                 collection_name: str = "memories"):  
         """Initialize the memory system.
         
         Args:
@@ -104,19 +106,34 @@ class AgenticMemorySystem:
             llm_model: Name of the LLM model
             evo_threshold: Number of memories before triggering evolution
             api_key: API key for the LLM service
+            persist_directory: If set, use PersistentChromaRetriever at this path
+            collection_name: ChromaDB collection name
         """
         self.memories = {}
         self.model_name = model_name
-        # Initialize ChromaDB retriever with empty collection
-        try:
-            # First try to reset the collection if it exists
-            temp_retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
-            temp_retriever.client.reset()
-        except Exception as e:
-            logger.warning(f"Could not reset ChromaDB collection: {e}")
-            
-        # Create a fresh retriever instance
-        self.retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
+        self.collection_name = collection_name
+
+        if persist_directory is not None:
+            self.retriever = PersistentChromaRetriever(
+                directory=persist_directory,
+                collection_name=self.collection_name,
+                model_name=self.model_name,
+                extend=True
+            )
+            self._load_memories_from_db()
+        else:
+            try:
+                temp_retriever = ChromaRetriever(
+                    collection_name=self.collection_name,
+                    model_name=self.model_name
+                )
+                temp_retriever.client.reset()
+            except Exception as e:
+                logger.warning(f"Could not reset ChromaDB collection: {e}")
+            self.retriever = ChromaRetriever(
+                collection_name=self.collection_name,
+                model_name=self.model_name
+            )
         
         # Initialize LLM controller
         self.llm_controller = LLMController(llm_backend, llm_model, api_key)
@@ -265,10 +282,21 @@ class AgenticMemorySystem:
     
     def consolidate_memories(self):
         """Consolidate memories: update retriever with new documents"""
-        # Reset ChromaDB collection
-        self.retriever = ChromaRetriever(collection_name="memories",model_name=self.model_name)
+        use_persistent = isinstance(self.retriever, PersistentChromaRetriever)
+        if use_persistent:
+            directory = Path(self.retriever.client._settings["persist_directory"])
+            self.retriever = PersistentChromaRetriever(
+                directory=str(directory),
+                collection_name=self.collection_name,
+                model_name=self.model_name,
+                extend=False
+            )
+        else:
+            self.retriever = ChromaRetriever(
+                collection_name=self.collection_name,
+                model_name=self.model_name
+            )
         
-        # Re-add all memory documents with their complete metadata
         for memory in self.memories.values():
             metadata = {
                 "id": memory.id,
@@ -586,6 +614,32 @@ class AgenticMemorySystem:
         except Exception as e:
             logger.error(f"Error in search_agentic: {str(e)}")
             return []
+
+    def _load_memories_from_db(self):
+        try:
+            db = self.retriever.collection.get(include=["metadatas", "documents"])
+            ids = db.get("ids", [])
+            docs = db.get("documents", [])
+            metas = db.get("metadatas", [])
+            for i, mem_id in enumerate(ids):
+                doc = docs[i] if i < len(docs) else ""
+                meta = metas[i] if i < len(metas) else {}
+                note = MemoryNote(
+                    content=doc,
+                    id=mem_id,
+                    keywords=meta.get("keywords", []),
+                    links=meta.get("links", []),
+                    retrieval_count=meta.get("retrieval_count", 0),
+                    timestamp=meta.get("timestamp", ""),
+                    last_accessed=meta.get("last_accessed", ""),
+                    context=meta.get("context", "General"),
+                    evolution_history=meta.get("evolution_history", []),
+                    category=meta.get("category", "Uncategorized"),
+                    tags=meta.get("tags", [])
+                )
+                self.memories[mem_id] = note
+        except Exception as e:
+            logger.warning(f"Could not load existing memories: {e}")
 
     def process_memory(self, note: MemoryNote) -> Tuple[bool, MemoryNote]:
         """Process a memory note and determine if it should evolve.

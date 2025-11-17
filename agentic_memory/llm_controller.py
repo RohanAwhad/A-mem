@@ -31,8 +31,7 @@ class OpenAIController(BaseLLMController):
                 {"role": "user", "content": prompt}
             ],
             response_format=response_format,
-            temperature=temperature,
-            max_tokens=1000
+            reasoning_effort='none' if self.model == 'gpt-5.1' else 'minimal',
         )
         return response.choices[0].message.content
 
